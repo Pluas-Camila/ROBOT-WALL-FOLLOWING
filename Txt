@@ -48,6 +48,13 @@ initializitation currentreading ofIMU
     L = -Phi(negative) 
 
 
+  if end-heading - change /_\ < = IMU <= end_heading + change
+    break
+    stop
+
+
+
+
 
 
 
