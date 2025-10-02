@@ -21,3 +21,25 @@ while loop:
   If distance - change in distance <= a <= distance +change in distance:
     STOP
     break return 1
+
+
+
+
+-==========================================================================================-
+
+Function2 rotation input angle can be positive and negative 
+{
+initializitation currentreading ofIMU 
+
+  if angle is negative then we are going clockwise 
+  if notwe are going counter cw
+
+  end_heading = (curr_heading + angle ) mod 360 or 2pi
+  
+
+
+
+
+
+
+}
