@@ -53,24 +53,46 @@ def side_PID(self, side_distance=0.1, Kp=3, side = 'Left'):  #side_distance=0.1 
     
 def Rotation (sef,degrees):
     
-
 #bot.move_to_start()
-def main ():
-    forward_distance = min(bot.get_lidar_range_image()[175:185])
-    forward_velocity =  bot.forward_PID()
-    delta_velocity = bot.side_PID()
-    side_distance =min(bot.get_lidar_range_image()[90:115])
-
-    if side_distance < .2: #bot to close to wall
-        left_v = forward_velocity
-        right_v = bot.sat(forward_velocity -delta_velocity)
-
-    elif(side_distance > .2):
-        left_v = bot.sat(forward_velocity -delta_velocity)
+def main ():  
+    while bot.experiment_supervisor.step(bot.timestamp) !=1:
+        forward_distance =bot.get_front_distance()
+        if forward_distance < bot.min_forward_wall_distance :
+            bot.rotate (-45)
+        forward_velocity =bot.forward_PID()
         right_v = forward_velocity
-    else:
         left_v = forward_velocity
-        right_v = forward_velocity
+        if side == "left":
+            delta_velocity = bot.side_PID(side="left")
+            side_distance = jeff.get_left_side_distance()
+
+            #too close
+            if side_distance < bot.desired_wall_follow_distance:
+                left_v = bot.sat(left_v+delta_velocity)        
+                right_v = bot.sat(ight_v+delta_velocity)     
+            #Too Far 
+            elif side_distance > bot.desired_wall_follow_distance:
+                right_v = bot.sat(left_v+delta_velocity)        
+                left_v = bot.sat(ight_v+delta_velocity)
+        else:
+            #right wall following
+            pass
+    # forward_distance = min(bot.get_lidar_range_image()[175:185])
+    # forward_velocity =  bot.forward_PID()
+    # delta_velocity = bot.side_PID()
+    # side_distance =min(bot.get_lidar_range_image()[90:115])
+    
+    # if side_distance < .2: #bot to close to wall
+    #     left_v = forward_velocity
+    #     right_v = bot.sat(forward_velocity -delta_velocity)
+    
+    # elif(side_distance > .2):
+    #     left_v = bot.sat(forward_velocity -delta_velocity)
+    #     right_v = forward_velocity
+    # else:
+    #     left_v = forward_velocity
+    #     right_v = forward_velocity
 
 bot.set_left_motor_velocity(left_v)
 bot.set_right_motor_velocity(right_v)
+
