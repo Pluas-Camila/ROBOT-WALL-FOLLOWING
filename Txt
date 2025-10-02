@@ -36,6 +36,16 @@ initializitation currentreading ofIMU
 
   end_heading = (curr_heading + angle ) mod 360 or 2pi
   
+  end_heading is our desired(d) from the equation  e(t) =  d-a
+
+  e(t)= | end_heading - IMU |   //absolute value 
+  Phi= Kp* e(t)
+  if CW
+    L = Phi (positive)
+    R = -Phi(negative)    
+  else CCW
+    R = Phi (positive)
+    L = -Phi(negative) 
 
 
 
