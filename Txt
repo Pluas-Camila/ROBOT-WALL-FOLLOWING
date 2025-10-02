@@ -1,0 +1,23 @@
+Class 2 
+
+Another way to PID
+Function (distance)
+inititalization 
+start_reading  => current_encoder_readings
+while loop:
+
+
+1. Meassure:
+  curr_reading -=> current encoder readings 
+  acceleration = radiusofW(curr_reading - start_reading)
+
+2. Send Control: 
+  Phi = Kp(distance - acceleration)
+
+3. Check:
+  Set both Left and Right Motores Set (Phi)
+
+4. Stop / Break:
+  If distance - change in distance <= a <= distance +change in distance:
+    STOP
+    break return 1
