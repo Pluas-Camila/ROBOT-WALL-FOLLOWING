@@ -40,10 +40,10 @@ initializitation currentreading ofIMU
 
   e(t)= | end_heading - IMU |   //absolute value 
   Phi= Kp* e(t)
-  if CW
+  if CW  <0
     L = Phi (positive)
     R = -Phi(negative)    
-  else CCW
+  else CCW >0
     R = Phi (positive)
     L = -Phi(negative) 
 
