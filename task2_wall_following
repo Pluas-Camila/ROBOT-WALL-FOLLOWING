@@ -25,13 +25,13 @@ AXLE_L = 0.184              # wheelbase [m]
 IDX_FRONT = 180
 IDX_LEFT  = 90
 IDX_RIGHT = 270
-IDX_LEFT_DIAG  = 60
+IDX_LEFT_DIAG  = 60         # corner/edge detection (detect loss of wall)
 IDX_RIGHT_DIAG = 300
 
 # --- Thresholds ---
-SLOW_FRONT_DIST = 1.20
-TURN_90_DIST = 0.60
-NO_WALL_DIST = 2.50
+SLOW_FRONT_DIST = 1.20      # start slowing if closer [m]
+TURN_90_DIST = 0.60         # turn 90° threshold speed [m]
+NO_WALL_DIST = 2.50         # assume wall end if distance exceeds [m]
 
 # --- PID Controller class ---
 class PID:
