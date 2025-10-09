@@ -1,0 +1,148 @@
+# task2_wall_follow.py
+# Lab 2 – Task 2: Wall Following with PID on Side Distance (Left or Right)
+# -------------------------------------------------------------------------
+# - Uses LIDAR side readings to maintain a smooth offset from a wall.
+# - PID controller adjusts angular velocity to keep constant clearance.
+# - Robot slows near obstacles, turns 90° at corners, and wraps around edges.
+# - Works for both left- and right-wall following (user-selectable).
+
+
+import math, time, argparse
+
+# --- PID constants (default tuned for stable behavior) ---
+KP = 1.8
+KI = 0.0
+KD = 0.12
+
+# --- Desired geometry and limits ---
+TARGET_SIDE_DIST = 0.50     # meters from wall
+V_CRUISE = 0.25             # m/s nominal forward speed
+V_MAX = 0.35
+W_MAX = 3.0
+AXLE_L = 0.184              # wheelbase [m]
+
+# --- LIDAR indices (FAIRIS) ---
+IDX_FRONT = 180
+IDX_LEFT  = 90
+IDX_RIGHT = 270
+IDX_LEFT_DIAG  = 60
+IDX_RIGHT_DIAG = 300
+
+# --- Thresholds ---
+SLOW_FRONT_DIST = 1.20
+TURN_90_DIST = 0.60
+NO_WALL_DIST = 2.50
+
+# --- PID Controller class ---
+class PID:
+    def __init__(self, kp, ki, kd, out_min=-W_MAX, out_max=W_MAX):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.i_sum = 0.0
+        self.prev_e = 0.0
+        self.out_min, self.out_max = out_min, out_max
+        self.initialized = False
+    def reset(self):
+        self.i_sum = 0.0
+        self.prev_e = 0.0
+        self.initialized = False
+    def update(self, r, y, dt):
+        e = r - y
+        self.i_sum += e * dt
+        d = 0.0 if not self.initialized else (e - self.prev_e)/max(dt,1e-6)
+        self.prev_e = e
+        self.initialized = True
+        u = self.kp*e + self.ki*self.i_sum + self.kd*d
+        return max(self.out_min, min(self.out_max, u)), e
+
+# --- Utility functions ---
+def sector_min(ranges, center, span=6):
+    vals = []
+    n = len(ranges)
+    for k in range(-span, span+1):
+        vals.append(float(ranges[(center+k)%n]))
+    return min(vals)
+def body_to_wheels(v, w):
+    return v - 0.5*AXLE_L*w, v + 0.5*AXLE_L*w
+def spin_90(robot, turn_sign, dt=0.032):
+    """In-place 90° spin (sign=+1 → CCW, −1 → CW)."""
+    w = turn_sign * 0.7*W_MAX
+    T = (math.pi/2)/abs(w)
+    t = 0.0
+    while t < T and robot.step() != -1:
+        vl, vr = body_to_wheels(0.0, w)
+        robot.set_wheel_speeds(vl, vr)
+        t += dt
+    robot.set_wheel_speeds(0.0,0.0)
+    time.sleep(0.1)
+
+# --- Wall following core ---
+def wall_follow(robot, side="left"):
+    """
+    PID-based wall following.
+      side='left'  → follow left wall (CCW)
+      side='right' → follow right wall (CW)
+    """
+    assert side in ("left","right")
+    print(f"[Task2] {side.upper()}-wall following | Target ={TARGET_SIDE_DIST:.2f} m")
+
+    dt = 0.032
+    pid = PID(KP, KI, KD)
+    turn_sign = +1.0 if side=="left" else -1.0
+    idx_side  = IDX_LEFT if side=="left" else IDX_RIGHT
+    idx_diag  = IDX_LEFT_DIAG if side=="left" else IDX_RIGHT_DIAG
+
+    while robot.step() != -1:
+        ranges = robot.get_lidar_range_image()
+        d_front = sector_min(ranges, IDX_FRONT, span=6)
+        d_side  = sector_min(ranges, idx_side, span=6)
+        d_diag  = sector_min(ranges, idx_diag, span=4)
+
+        # --- PID on side distance → angular velocity ---
+        w_cmd, e_side = pid.update(TARGET_SIDE_DIST, d_side, dt)
+
+        # --- Forward speed logic ---
+        v_cmd = V_CRUISE
+        if d_front < SLOW_FRONT_DIST:
+            scale = (d_front - TURN_90_DIST)/(SLOW_FRONT_DIST - TURN_90_DIST)
+            v_cmd = V_CRUISE * max(0.1, min(1.0, scale))
+        if d_diag < 0.8:  # tighter corner
+            v_cmd = min(v_cmd, 0.18)
+
+        # --- 90° turn on frontal obstacle ---
+        if d_front < TURN_90_DIST:
+            print(f"[{side}] FRONT {d_front:.2f} m → turn 90°")
+            spin_90(robot, turn_sign, dt)
+            pid.reset()
+            continue
+
+        # --- Wall end (edge) handling ---
+        if d_side > NO_WALL_DIST:
+            print(f"[{side}] LOST wall (side {d_side:.2f}) → wrap")
+            w_cmd = turn_sign * 1.0
+            v_cmd = 0.15
+
+        # --- Apply motion ---
+        vl, vr = body_to_wheels(v_cmd, w_cmd)
+        robot.set_wheel_speeds(vl, vr)
+        print(f"[{side}] front={d_front:4.2f}  side={d_side:4.2f}  e={e_side:+5.3f}  v={v_cmd:.2f}  w={w_cmd:+.2f}")
+
+# --- Adapter for FAIRIS-Lite robot ---
+class MyRobotAdapter:
+    def __init__(self):
+        from MyRobot import MyRobot
+        self.bot = MyRobot()
+    def step(self): return self.bot.step()
+    def get_lidar_range_image(self): return self.bot.get_lidar_range_image()
+    def set_wheel_speeds(self, vl, vr): self.bot.set_wheel_speeds(vl, vr)
+
+# --- Entry point ---
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--side", choices=["left","right"], required=True,
+                        help="Choose wall side to follow.")
+    args = parser.parse_args()
+    robot = MyRobotAdapter()
+    wall_follow(robot, side=args.side)
+
+if __name__ == "__main__":
+    main()
