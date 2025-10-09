@@ -53,7 +53,7 @@ def main():
 
             # 3) Stop exactly within deadband: zero command + reset integral
             if abs(e) <= DEADBAND:
-                v_cmd = 0.0
+                bot.stop_motors() 
                 i_acc = 0.0
             else:
                 # PID (discrete, minimal)
@@ -69,7 +69,7 @@ def main():
 
             # Safety: hard brake if absurdly close
             if y < 0.10:
-                v_cmd = 0.0
+                bot.stop_motors() 
                 i_acc = 0.0
 
             # 4) Send equal wheel speeds (straight); convert m/s → RPM only here
