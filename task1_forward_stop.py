@@ -1,110 +1,109 @@
-# task1_forward_stop.py
-# Lab 2 - Task 1: Forward PID (P-only) wall stop using LIDAR minimum
-# ---------------------------------------------------------------
-# - Uses the minimum distance in a front sector (no averaging).
-# - Controls only forward speed (no steering).
-# - If closer than the target, backs up gently until at setpoint.
+# task1_forward_stop_hambot.py
+# Lab 2 – Task 1 (HamBot): PID forward wall stop using LIDAR (front sector min)
+# -------------------------------------------------------------------------------
+# - Uses LIDAR.get_current_scan via HamBot.get_range_image()    (360 beams, deg: 0=back, 90=left, 180=front, 270=right)
+# - Pure forward controller: PID sets equal wheel speeds (no steering)
+# - If < 1.0 m, robot gently backs up to 1.0 m
+# - Prints measured forward distance continuously
 
+import time, math
+from robot_systems.robot import HamBot
 
-import time
+# ===== Robot geometry (for m/s ↔ RPM) =====
+R_WHEEL = 0.045     # m
+AXLE_L  = 0.184     # m
 
-# ===============================================================
-#  PID CONFIGURATION
-# ===============================================================
-KP = 1.0        # Proportional gain
-KI = 0.1        # Integral gain
-KD = 0.5        # Derivative gain
-TARGET_DIST = 1.0      # desired distance from wall (meters)
-MAX_SPEED = 2.0         # maximum forward speed (m/s)
-MIN_SPEED = -2.0        # maximum reverse speed (m/s)
-DEADBAND = 0.02         # acceptable ±2 cm band
+# ===== Safety limits (HamBot clamps to ±75 RPM) =====
+RPM_MAX = 75.0
+RPM_MIN = -75.0
 
-# LIDAR setup
-FRONT_IDX = 180         # 180° = directly in front
-SECTOR = 10             # check ±10° around front
+# ===== Controller targets & loop timing =====
+TARGET = 1.00       # m (desired front distance)
+DEADBAND = 0.02     # ±2 cm
+DT = 0.032          # s control period (match assignment)
+FRONT_SPAN = 6      # use ±6° around 180
 
-# ===============================================================
-#  PID CONTROLLER CLASS
-# ===============================================================
-class PIDController:
-    def __init__(self, kp, ki, kd):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.prev_error = 0.0
-        self.integral = 0.0
+# ===== PID gains (sweep per assignment: 0.001, 0.01, 0.5, 1.0, 5.0, 10.0) =====
+KP = 1.0
+KI = 0.05
+KD = 0.10
 
-    def update(self, error, dt):
-        """Compute PID control signal."""
-        # proportional
-        p = self.kp * error
+def mps_to_rpm(v_mps: float) -> float:
+    """Linear wheel speed [m/s] -> RPM."""
+    return (v_mps / (2.0 * math.pi * R_WHEEL)) * 60.0
 
-        # integral
-        self.integral += error * dt
-        i = self.ki * self.integral
+def sector_min(ranges, center=180, half_span=FRONT_SPAN):
+    """Min range in small sector around 'center' index (wrap 0..359)."""
+    n = len(ranges)
+    vals = []
+    for k in range(-half_span, half_span + 1):
+        v = float(ranges[(center + k) % n])
+        if v > 0:  # ignore invalid zeros
+            vals.append(v)
+    return min(vals) if vals else 6.0
 
-        # derivative
-        d = self.kd * (error - self.prev_error) / dt if dt > 0 else 0.0
-        self.prev_error = error
+def saturate(val, lo, hi):
+    return max(lo, min(hi, val))
 
-        # control output
-        u = p + i + d
-        return u
-
-# ===============================================================
-#  HELPER FUNCTIONS
-# ===============================================================
-def get_front_distance(robot):
-    """
-    Reads the LIDAR data and returns the minimum distance in a small
-    angular window around the front direction (180°).
-    """
-    ranges = robot.get_lidar_range_image()
-    start = FRONT_IDX - SECTOR
-    end = FRONT_IDX + SECTOR
-    front_window = ranges[start:end]
-    return min(front_window)
-
-def saturate(value, lo, hi):
-    """Clamp motor velocity to physical limits."""
-    return max(lo, min(hi, value))
-
-# ===============================================================
-#  MAIN CONTROL LOOP
-# ===============================================================
 def main():
-    from MyRobot import MyRobot
-    robot = MyRobot()
+    bot = HamBot(lidar_enabled=True, camera_enabled=False)
+    print(f"\n[Task1/HamBot] Forward PID → target {TARGET:.2f} m  (dt={DT:.3f}s)")
+    print(f"Gains: Kp={KP}, Ki={KI}, Kd={KD} | RPM limit ±{RPM_MAX:.0f}")
 
-    pid = PIDController(KP, KI, KD)
-    dt = 0.032  # timestep from assignment
+    # PID state
+    i_acc = 0.0
+    e_prev = 0.0
+    t_prev = time.time()
 
-    print(f"\n--- PID Forward Wall Stop ---")
-    print(f"Kp={KP}, Ki={KI}, Kd={KD}, Target={TARGET_DIST} m")
+    try:
+        while True:
+            t0 = time.time()
+            # 1) Measure front distance (min of sector around 180°)
+            ranges = bot.get_range_image()
+            if ranges == -1:
+                print("[WARN] LIDAR not enabled or no data; stopping.")
+                bot.stop_motors()
+                time.sleep(0.5)
+                continue
+            y = sector_min(ranges, center=180, half_span=FRONT_SPAN)
 
-    while robot.step() != -1:
-        # 1️⃣ Measure actual distance
-        actual = get_front_distance(robot)
+            # 2) Error e = r - y  (positive if too far; negative if too close)
+            e = TARGET - y
 
-        # 2️⃣ Compute error (desired - measured)
-        error = TARGET_DIST - actual
+            # 3) PID (discrete)
+            dt = max(DT, time.time() - t_prev)
+            i_acc += e * dt
+            d = (e - e_prev) / dt if dt > 0 else 0.0
+            u = KP * e + KI * i_acc + KD * d   # body forward speed command [m/s]
 
-        # 3️⃣ Compute PID output (forward speed)
-        control = pid.update(error, dt)
-        control = saturate(control, MIN_SPEED, MAX_SPEED)
+            # 4) Deadband & safety
+            if abs(e) <= DEADBAND:
+                u = 0.0
 
-        # 4️⃣ Apply deadband — stop when within ±2 cm
-        if abs(error) < DEADBAND:
-            control = 0.0
+            # 5) Convert to wheel RPM (equal wheels -> straight)
+            rpm = mps_to_rpm(u)
+            rpm = saturate(rpm, RPM_MIN, RPM_MAX)
 
-        # 5️⃣ Apply equal wheel speeds (forward only)
-        robot.set_wheel_speeds(control, control)
+            # 6) Send commands (HamBot left is inverted inside the class setter)
+            bot.set_left_motor_speed(rpm)
+            bot.set_right_motor_speed(rpm)
 
-        # 6️⃣ Print diagnostics
-        print(f"Dist={actual:5.2f} m  Err={error:+6.3f}  u={control:+6.3f}")
+            # 7) Print diagnostics (continuous)
+            print(f"[Task1] front={y:5.2f} m | e={e:+6.3f} | v={u:+.3f} m/s | rpm={rpm:+6.1f}")
 
-        # optional: delay slightly for clarity
-        time.sleep(dt)
+            # PID state update
+            e_prev = e
+            t_prev = time.time()
+
+            # Loop pacing
+            elapsed = time.time() - t0
+            if elapsed < DT:
+                time.sleep(DT - elapsed)
+
+    except KeyboardInterrupt:
+        print("\n[Task1] Stopping…")
+    finally:
+        bot.stop_motors()
 
 if __name__ == "__main__":
     main()
