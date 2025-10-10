@@ -1,178 +1,174 @@
-# task2_wall_follow_hambot.py
-# Lab 2 – Task 2 (HamBot): PID Wall Following (Left/Right) with LIDAR
-# --------------------------------------------------------------------
-# Exceeds-level behaviors:
-#  ✓ Smooth PID on side distance (offset tracking)
-#  ✓ Reliable 90° corners + sharp edges (wrap-around)
-#  ✓ Left & Right modes work consistently
+# task2_wall_follow_hambot_min.py
+# -------------------------------------------------------------
+# HamBot Task 2: Minimal & steady wall-follow (left or right)
+# - Uses ONE side ray (PID) + ONE front ray (corner turn)
+# - FOLLOW state: forward RPM fixed, small PI steer (keeps both wheels forward)
+# - TURN state: fixed 0.65 s in-place spin toward chosen wall
+# - Hysteresis + cooldown on front detection to avoid spin-go-spin pattern
+# -------------------------------------------------------------
 
-import math, time, argparse
+import time, math
 from robot_systems.robot import HamBot
 
-# ===== Robot geometry / limits =====
-R_WHEEL = 0.045   # m
-AXLE_L  = 0.184   # m
-RPM_MAX = 75.0
-RPM_MIN = -75.0
+# ====== Choose wall side ======
+FOLLOW_SIDE = 'left'              # 'left' or 'right'
+SIDE_SIGN   = (+1.0 if FOLLOW_SIDE == 'left' else -1.0)
 
-# ===== Body speed caps (converted to RPM at send time) =====
-V_CRUISE = 0.25   # m/s forward nominal
-V_MAX    = 0.30   # m/s cap
-W_MAX    = 3.00   # rad/s yaw cap
+# ====== LIDAR indices (0: back, 90: left, 180: front, 270: right) ======
+FRONT_IDX = 180
+SIDE_IDX  =  90 if FOLLOW_SIDE == 'left' else 270
+MM_TO_M   = 1.0 / 1000.0
 
-# ===== LIDAR indices (FAIRIS/your lab convention) =====
-IDX_BACK  = 0
-IDX_LEFT  = 90
-IDX_FRONT = 180
-IDX_RIGHT = 270
-IDX_LDIAG = 60     # rear-ish diagonal to sense wall continuity
-IDX_RDIAG = 300
+# ====== Control period ======
+DT = 0.032
 
-# ===== Thresholds / references =====
-REF_SIDE        = 0.50  # m (target offset to wall)
-SLOW_FRONT_DIST = 1.20  # m
-TURN_90_DIST    = 0.60  # m => perform 90° in-place turn
-NO_WALL_DIST    = 2.50  # m => wrap-around to reacquire wall
-DT              = 0.032 # s
+# ====== Targets & thresholds (meters) ======
+TARGET_OFFSET      = 0.30    # desired distance from wall
+# Front hysteresis: smaller "ON", larger "OFF"
+FRONT_BLOCK_ON     = 0.30    # enter TURN if front < 0.30 m (after debounce)
+FRONT_BLOCK_OFF    = 0.36    # consider cleared when front > 0.36 m
+FRONT_DEBOUNCE_N   = 4       # frames below ON to trigger a turn
+TURN_COOLDOWN_SEC  = 1.8     # ignore front trigger for a bit after turning
+EMERGENCY_STOP     = 0.12    # hard stop if dangerously close
 
-# ===== Hard-coded PID gains for angular control  =====
-KP = 1.8
-KI = 0.0
-KD = 0.12
+# ====== Motors ======
+RPM_MAX            = 75.0
+BASE_RPM           = 45.0     # forward RPM in FOLLOW
+FOLLOW_TURN_FRAC   = 0.45     # keep |turn| <= frac * forward -> both wheels stay forward
+TURN_RPM_FIXED     = 50.0     # in-place spin RPM (TURN state)
+TURN_DURATION_S    = 0.65     # hard-coded ~90° spin (coarse but OK)
 
-def mps_to_rpm(v_mps: float) -> float:
-    return (v_mps / (2.0 * math.pi * R_WHEEL)) * 60.0
+# ====== Side PI (steering) in RPM units ======
+Kp_turn            = 120.0    # smaller = straighter; larger = tighter to wall
+Ki_turn            =   6.0    # small integral to remove bias
+I_CLAMP            =  80.0    # limit integral contribution
+E_DB               = 0.01     # do not integrate tiny noise
 
-def sector_min(ranges, center, half_span=6):
-    """Min range in a small sector around index 'center' (wrap 0..359)."""
-    n = len(ranges)
-    vals = []
-    for k in range(-half_span, half_span + 1):
-        v = float(ranges[(center + k) % n])
-        if v > 0:
-            vals.append(v)
-    return min(vals) if vals else 6.0
+def clamp(x, lo, hi): return max(lo, min(hi, x))
 
-def saturate(x, lo, hi):
-    return max(lo, min(hi, x))
+def get_m(scan, idx, last=None):
+    if scan == -1 or len(scan) <= idx:
+        return last
+    v = float(scan[idx])
+    if not math.isfinite(v) or v <= 0.0:
+        return last
+    return v * MM_TO_M
 
-class PID:
-    def __init__(self, kp, ki, kd, umin=-W_MAX, umax=W_MAX):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.umin, self.umax = umin, umax
-        self.iacc = 0.0
-        self.eprev = 0.0
-        self.init = False
-    def reset(self):
-        self.iacc = 0.0
-        self.eprev = 0.0
-        self.init = False
-    def update(self, r, y, dt):
-        e = r - y
-        self.iacc += e * dt
-        d = 0.0 if not self.init else (e - self.eprev) / max(dt, 1e-6)
-        self.eprev = e
-        self.init = True
-        u = self.kp*e + self.ki*self.iacc + self.kd*d
-        return saturate(u, self.umin, self.umax), e
-
-def body_to_wheels_rpm(v, w):
-    """Map body (v,w) -> wheel linear speeds, then to RPM, with clamp."""
-    vr = v + 0.5*AXLE_L*w
-    vl = v - 0.5*AXLE_L*w
-    rpm_r = saturate(mps_to_rpm(vr), RPM_MIN, RPM_MAX)
-    rpm_l = saturate(mps_to_rpm(vl), RPM_MIN, RPM_MAX)
-    return rpm_l, rpm_r
-
-def spin_90(bot, turn_sign=+1.0):
-    """
-    Clean 90° in-place spin:
-      - turn_sign = +1 (left-wall) -> CCW spin
-      - turn_sign = -1 (right-wall) -> CW spin
-    Uses constant |w| and duration T = (pi/2)/|w|.
-    """
-    w_spin = 0.7 * W_MAX  # conservative
-    T = (math.pi / 2.0) / w_spin
-    t0 = time.time()
-    while time.time() - t0 < T:
-        rpm_l, rpm_r = body_to_wheels_rpm(0.0, turn_sign * w_spin)
-        # Note: set_left_motor_speed inverts internally for mounting, so send raw RPMs
-        bot.set_left_motor_speed(rpm_l)
-        bot.set_right_motor_speed(rpm_r)
-        time.sleep(DT)
-    # settle
+def spin_fixed(bot: HamBot, direction: str, rpm=TURN_RPM_FIXED, dur=TURN_DURATION_S):
+    # In-place spin uses opposite signs on wheels
+    if direction == 'left':
+        bot.set_left_motor_speed(-rpm)
+        bot.set_right_motor_speed(+rpm)
+    else:
+        bot.set_left_motor_speed(+rpm)
+        bot.set_right_motor_speed(-rpm)
+    time.sleep(dur)
     bot.stop_motors()
-    time.sleep(0.1)
+    time.sleep(0.05)
 
-def wall_follow(bot, side="left"):
-    """
-    PID-based wall following on HamBot (LIDAR-only).
-    side = 'left' or 'right'
-    """
-    assert side in ("left", "right")
-    turn_sign = +1.0 if side == "left" else -1.0
-    idx_side  = IDX_LEFT if side == "left" else IDX_RIGHT
-    idx_diag  = IDX_LDIAG if side == "left" else IDX_RDIAG
+def main():
+    bot = HamBot(lidar_enabled=True, camera_enabled=False)
+    print(f"[Task2] {FOLLOW_SIDE.upper()} wall-follow | target={TARGET_OFFSET:.2f} m")
 
-    pid_w = PID(KP, KI, KD)
-    print(f"\n[Task2/HamBot] {side.upper()}-wall following | ref={REF_SIDE:.2f} m | dt={DT:.3f}s")
-    print(f"Gains: Kp={KP}, Ki={KI}, Kd={KD} | V_cruise={V_CRUISE:.2f} m/s")
+    # --- State ---
+    mode = "FOLLOW"
+    front_below_ctr = 0
+    turn_cooldown_until = 0.0
+
+    # --- PI state ---
+    integ = 0.0
+
+    # Last valid distances (hold on glitches)
+    y_front = None
+    y_side  = None
 
     try:
         while True:
-            t_loop = time.time()
-            ranges = bot.get_range_image()
-            if ranges == -1:
-                print("[WARN] LIDAR not enabled or no data; stopping.")
+            t0 = time.time()
+            scan = bot.get_range_image()
+            if scan == -1:
                 bot.stop_motors()
-                time.sleep(0.5)
+                print("[WARN] LIDAR not ready…")
+                time.sleep(0.1)
                 continue
 
-            # Measurements
-            d_front = sector_min(ranges, IDX_FRONT, half_span=6)  # obst/corner
-            d_side  = sector_min(ranges, idx_side,  half_span=6)  # control
-            d_diag  = sector_min(ranges, idx_diag,  half_span=4)  # smoothing
+            # Read meters
+            y_front_new = get_m(scan, FRONT_IDX, y_front)
+            y_side_new  = get_m(scan, SIDE_IDX,  y_side if y_side is not None else 0.8)
+            if y_front_new is None or y_side_new is None:
+                bot.stop_motors()
+                time.sleep(0.05)
+                continue
+            y_front, y_side = y_front_new, y_side_new
 
-            # 1) PID on side distance -> angular velocity
-            w_cmd, e_side = pid_w.update(REF_SIDE, d_side, DT)
-
-            # 2) Forward velocity scheduling (slow near obstacles/corners)
-            v_cmd = V_CRUISE
-            if d_front < SLOW_FRONT_DIST:
-                # linear ramp between TURN_90_DIST..SLOW_FRONT_DIST
-                scale = (d_front - TURN_90_DIST) / max(SLOW_FRONT_DIST - TURN_90_DIST, 1e-6)
-                v_cmd = V_CRUISE * saturate(scale, 0.1, 1.0)
-            if d_diag < 0.8:
-                v_cmd = min(v_cmd, 0.18)
-
-            # 3) Hard corner: 90° turn if front is very close
-            if d_front < TURN_90_DIST:
-                print(f"[{side}] FRONT {d_front:.2f} m → 90° turn")
-                spin_90(bot, turn_sign=turn_sign)
-                pid_w.reset()
+            # Emergency stop if front is dangerously close
+            if y_front < EMERGENCY_STOP:
+                print(f"[SAFE] Front too close: {y_front:.2f} m → STOP")
+                bot.stop_motors()
+                time.sleep(0.1)
                 continue
 
-            # 4) Sharp edge: lost wall on side -> wrap toward chosen wall
-            if d_side > NO_WALL_DIST:
-                print(f"[{side}] LOST wall (side {d_side:.2f}) → wrap")
-                w_cmd = turn_sign * 1.0
-                v_cmd = 0.15
+            # -------------------
+            # Mode: FOLLOW
+            # -------------------
+            if mode == "FOLLOW":
+                # Hysteresis + debounce + cooldown for front detection
+                now = time.time()
+                if now >= turn_cooldown_until:
+                    if y_front < FRONT_BLOCK_ON:
+                        front_below_ctr += 1
+                    elif y_front > FRONT_BLOCK_OFF:
+                        front_below_ctr = 0
+                    # else: between ON/OFF -> keep current counter (hysteresis)
+                else:
+                    front_below_ctr = 0  # ignore triggers during cooldown
 
-            # Clamp body speeds
-            v_cmd = saturate(v_cmd, 0.0, V_MAX)
-            w_cmd = saturate(w_cmd, -W_MAX, W_MAX)
+                # Trigger turn only if sustained
+                if front_below_ctr >= FRONT_DEBOUNCE_N:
+                    print(f"[TURN] front={y_front:.2f} m < {FRONT_BLOCK_ON:.2f} (debounced)")
+                    bot.stop_motors()
+                    mode = "TURN"
+                    continue
 
-            # Send wheel RPMs
-            rpm_l, rpm_r = body_to_wheels_rpm(v_cmd, w_cmd)
-            bot.set_left_motor_speed(rpm_l)
-            bot.set_right_motor_speed(rpm_r)
+                # --- Side PI (steer) ---
+                e = y_side - TARGET_OFFSET   # positive if too far from wall
+                if abs(e) > E_DB:
+                    integ += e * DT
+                    integ = clamp(integ, -I_CLAMP/max(Ki_turn,1e-9), I_CLAMP/max(Ki_turn,1e-9))
 
-            # Debug
-            print(f"[{side}] front={d_front:4.2f}  side={d_side:4.2f}  diag={d_diag:4.2f}  "
-                  f"e={e_side:+5.3f}  v={v_cmd:.2f}  w={w_cmd:+.2f}  rpmL={rpm_l:+6.1f} rpmR={rpm_r:+6.1f}")
+                turn_rpm = SIDE_SIGN * (Kp_turn * e + Ki_turn * integ)
 
-            # Loop pacing
-            elapsed = time.time() - t_loop
+                # Forward RPM
+                v_rpm = BASE_RPM
+
+                # *** Keep both wheels forward in FOLLOW ***
+                follow_turn_max = FOLLOW_TURN_FRAC * v_rpm
+                turn_rpm = clamp(turn_rpm, -follow_turn_max, follow_turn_max)
+
+                # Mix so +turn (for LEFT) bends LEFT: left > right
+                left_rpm  = clamp(v_rpm + turn_rpm, -RPM_MAX, RPM_MAX)
+                right_rpm = clamp(v_rpm - turn_rpm, -RPM_MAX, RPM_MAX)
+
+                bot.set_left_motor_speed(left_rpm)
+                bot.set_right_motor_speed(right_rpm)
+
+                print(f"[FOLLOW] side={y_side:.3f}m front={y_front:.3f}m e={e:+.3f} "
+                      f"turn={turn_rpm:+5.1f} v={v_rpm:4.1f}  L={left_rpm:5.1f} R={right_rpm:5.1f}")
+
+            # -------------------
+            # Mode: TURN
+            # -------------------
+            elif mode == "TURN":
+                spin_fixed(bot, direction=FOLLOW_SIDE, rpm=TURN_RPM_FIXED, dur=TURN_DURATION_S)
+                # Reset PI & debounce, and start a cooldown window
+                integ = 0.0
+                front_below_ctr = 0
+                turn_cooldown_until = time.time() + TURN_COOLDOWN_SEC
+                mode = "FOLLOW"
+                print("[MODE] TURN → FOLLOW (cooldown active)")
+
+            # Pace loop to DT
+            elapsed = time.time() - t0
             if elapsed < DT:
                 time.sleep(DT - elapsed)
 
@@ -180,14 +176,6 @@ def wall_follow(bot, side="left"):
         print("\n[Task2] Stopping…")
     finally:
         bot.stop_motors()
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--side", choices=["left", "right"], required=True,
-                        help="Which wall to follow.")
-    args = parser.parse_args()
-    bot = HamBot(lidar_enabled=True, camera_enabled=False)
-    wall_follow(bot, side=args.side)
 
 if __name__ == "__main__":
     main()
