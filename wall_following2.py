@@ -22,13 +22,13 @@ class WallFollowerPID(HamBot):
     # SENSOR HELPERS
     # -------------------------
     def get_left_side_distance(self):
-        return min(self.get_lidar_range_image()[90:175])
+        return min(self.get_range_image()[90:175])
 
     def get_right_side_distance(self):
-        return min(self.get_lidar_range_image()[185:270])
+        return min(self.get_range_image()[185:270])
 
     def get_front_distance(self):
-        return min(self.get_lidar_range_image()[175:185])
+        return min(self.get_range_image()[175:185])
 
     # -------------------------
     # MOTOR + CONTROL UTILITIES
@@ -38,33 +38,33 @@ class WallFollowerPID(HamBot):
         return max(-self.max_motor_velocity, min(self.max_motor_velocity, v))
 
     def stop(self):
-        self.set_left_motor_velocity(0)
-        self.set_right_motor_velocity(0)
+        self.set_left_motor_speed(0)
+        self.set_right_motor_speed(0)
 
     # -------------------------
     # PID-BASED ROTATION
     # -------------------------
     def rotate_to(self, end_bearing, margin_error=0.5):
         """Rotate until compass reading matches desired bearing."""
-        while self.experiment_supervisor.step(self.timestep) != -1:
+        while True:
             self.rotation_PID(end_bearing)
 
-            heading = self.get_compass_reading()
+            heading = self.get_encoder_readings()
             if end_bearing - margin_error <= heading <= end_bearing + margin_error:
                 self.stop()
                 break
 
     def rotation_PID(self, target_bearing):
-        current = self.get_compass_reading()
+        current = self.get_encoder_readings()
         error = (target_bearing - current + 540) % 360 - 180  # shortest turn direction
         phi = self.sat(self.Kp * error * 0.01)
         
         if error > 0:
-            self.set_left_motor_velocity(-phi)
-            self.set_right_motor_velocity(phi)
+            self.set_left_motor_speed(-phi)
+            self.set_right_motor_speed(phi)
         else:
-            self.set_left_motor_velocity(phi)
-            self.set_right_motor_velocity(-phi)
+            self.set_left_motor_speed(phi)
+            self.set_right_motor_speed(-phi)
 
     # -------------------------
     # WALL FOLLOWING PID
@@ -102,15 +102,15 @@ class WallFollowerPID(HamBot):
         correction = self.wall_follow_PID(side='left')
         left_v = self.sat(linear_speed - correction)
         right_v = self.sat(linear_speed + correction)
-        self.set_left_motor_velocity(left_v)
-        self.set_right_motor_velocity(right_v)
+        self.set_left_motor_speed(left_v)
+        self.set_right_motor_speed(right_v)
 
     # -------------------------
     # 90° ROTATION LOGIC
     # -------------------------
     def rotate_90(self, angle=90):
         """Rotate 90 degrees (turn away from obstacle)."""
-        start_heading = self.get_compass_reading()
+        start_heading = self.get_encoder_readings()
         end_bearing = (start_heading + angle) % 360
         if end_bearing >= 360:
             end_bearing -= 360
@@ -119,7 +119,32 @@ class WallFollowerPID(HamBot):
     # -------------------------
     # MAIN CONTROL LOOP
     # -------------------------
-    def run(self):
-        """Main loop: wall follow indefinitely."""
-        while self.experiment_supervisor.step(self.timestep) != -1:
-            self.go_forward()
+    # def run(self):
+    #     """Main loop: wall follow indefinitely."""
+    #     while self.experiment_supervisor.step(self.timestep) != -1:
+    #         self.go_forward()
+
+
+if __name__ == "__main__":
+    bot = WallFollowerPID()
+    print("Starting LEFT wall following...")
+
+    while True:
+        front_dist = bot.get_front_distance()
+        side_dist = bot.get_left_side_distance()
+
+        # If there’s a wall ahead — turn left 90°
+        if front_dist < 0.25:
+            bot.stop()
+            bot.rotate_90(angle=90)
+            continue
+
+        # Use PID correction to follow left wall
+        correction = bot.wall_follow_PID(side='left', desired_dist=0.2)
+
+        forward_v = 3.0
+        left_v = bot.sat(forward_v - correction)
+        right_v = bot.sat(forward_v + correction)
+
+        bot.set_left_motor_speed(left_v)
+        bot.set_right_motor_speed(right_v)
