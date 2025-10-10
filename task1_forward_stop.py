@@ -1,114 +1,136 @@
 # task1_forward_stop.py
-# Lab 2 - Task 1: Forward PID (P-only) wall stop using LIDAR minimum
-# ---------------------------------------------------------------
-# - Uses the minimum distance in a front sector (no averaging).
-# - Controls only forward speed (no steering).
-# - If closer than the target, backs up gently until at setpoint.
+# Lab 2 – Task 1 (HamBot): ONE-RAY full PID forward wall stop with anti-windup
+# ---------------------------------------------------------------------------
+# - Reads one LIDAR ray (index 180) -> meters
+# - PID drives straight speed (same-sign RPM to both wheels)
+# - Derivative on measurement (less kick), anti-windup on saturation
+# - Deadband + integral reset for crisp stop
+# - Tiny EMA smoothing on the single ray (still "one ray" logic)
 
+import time, math
+from robot_systems.robot import HamBot
 
-import math
-import time
+# ====== Lab targets ======
+TARGET      = 1.0        # [m] stop distance
+DEADBAND    = 0.01       # [m] ±1 cm
 
-# ===============================================================
-#  PID CONFIGURATION
-# ===============================================================
-KP = 1.0        # Proportional gain
-KI = 0.1        # Integral gain
-KD = 0.5        # Derivative gain
-TARGET_DIST = 0.5       # desired distance from wall (meters)
-MAX_SPEED = 1.0         # maximum forward speed (m/s)
-MIN_SPEED = -1.0        # maximum reverse speed (m/s)
-DEADBAND = 0.02         # acceptable ±2 cm band
+# ====== Timing ======
+DT          = 0.032      # [s] control period
 
-# LIDAR setup
-FRONT_IDX = 180         # 180° = directly in front
-SECTOR = 10             # check ±10° around front
+# ====== One-ray LIDAR ======
+FRONT_IDX   = 180
+MM_TO_M     = 1.0 / 1000.0
 
-# ===============================================================
-#  PID CONTROLLER CLASS
-# ===============================================================
-class PIDController:
-    def __init__(self, kp, ki, kd, i_clamp=None, d_smooth=0.0):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.prev_error = 0.0
-        self.integral = 0.0
-        self.prev_d = 0.0
-        self.i_clamp = i_clamp
-        self.d_smooth = max(0.0, min(0.99, d_smooth))
+# ====== Motor limits ======
+RPM_MAX     = 75.0       # HamBot clamp
+# Optional: cap speed with softer limit to help PID tuning
+RPM_SOFT    = 50.0
 
-    def update(self, error, dt):
-        """Compute PID control signal."""
-        # proportional
-        p = self.kp * error
+# ====== PID gains (units: RPM per m, RPM per (m*s), RPM per m/s) ======
+# Start conservative; increase Kp for quicker approach; add small Ki for zero steady-state error; Kd to damp overshoot.
+Kp_rpm      = 45.0       # proportional
+Ki_rpm      = 6.0        # integral (small)
+Kd_rpm      = 12.0       # derivative on measurement
 
-        # integral
-        self.integral += error * dt
-        i = self.ki * self.integral
+# ====== Integral guard / smoothing ======
+I_CLAMP     = 150.0      # limit absolute integral contribution (RPM-equivalent)
+EMA_ALPHA   = 0.15       # 0=no smoothing, 1=raw; 0.1–0.2 good for noisy single ray
 
-        # derivative
-        d = self.kd * (error - self.prev_error) / dt if dt > 0 else 0.0
-        self.prev_error = error
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-        # control output
-        u = p + i + d
-        return u
-
-# ===============================================================
-#  HELPER FUNCTIONS
-# ===============================================================
-def get_front_distance(robot):
-    """
-    Reads the LIDAR data and returns the minimum distance in a small
-    angular window around the front direction (180°).
-    """
-    ranges = robot.get_lidar_range_image()
-    start = FRONT_IDX - SECTOR
-    end = FRONT_IDX + SECTOR
-    front_window = ranges[start:end]
-    return min(front_window)
-
-def saturate(value, lo, hi):
-    """Clamp motor velocity to physical limits."""
-    return max(lo, min(hi, value))
-
-# ===============================================================
-#  MAIN CONTROL LOOP
-# ===============================================================
 def main():
-    from MyRobot import MyRobot
-    robot = MyRobot()
+    bot = HamBot(lidar_enabled=True, camera_enabled=False)
+    print(f"[Task1/PID] TARGET={TARGET:.2f} m | dt={DT:.3f}s | "
+          f"Kp={Kp_rpm}, Ki={Ki_rpm}, Kd={Kd_rpm} (RPM units)")
 
-    pid = PIDController(KP, KI, KD)
-    dt = 0.032  # timestep from assignment
+    # PID state
+    integ    = 0.0         # integral term (in “error-m*s” space, scaled by Ki_rpm when used)
+    y_prev   = None        # previous distance [m]
+    y_filt   = None        # EMA filtered distance
+    first    = True
 
-    print(f"\n--- PID Forward Wall Stop ---")
-    print(f"Kp={KP}, Ki={KI}, Kd={KD}, Target={TARGET_DIST} m")
+    try:
+        while True:
+            t0 = time.time()
 
-    while robot.step() != -1:
-        # 1️⃣ Measure actual distance
-        actual = get_front_distance(robot)
+            scan = bot.get_range_image()
+            if scan == -1 or len(scan) <= FRONT_IDX:
+                bot.stop_motors()
+                print("[WARN] LIDAR not ready…")
+                time.sleep(0.1)
+                continue
 
-        # 2️⃣ Compute error (desired - measured)
-        error = TARGET_DIST - actual
+            raw = float(scan[FRONT_IDX])
+            if not math.isfinite(raw) or raw <= 0.0:
+                bot.stop_motors()
+                print("[WARN] invalid front sample; waiting…")
+                time.sleep(0.05)
+                continue
 
-        # 3️⃣ Compute PID output (forward speed)
-        control = pid.update(error, dt)
-        control = saturate(control, MIN_SPEED, MAX_SPEED)
+            # 1) distance in meters
+            y = raw * MM_TO_M
 
-        # 4️⃣ Apply deadband — stop when within ±2 cm
-        if abs(error) < DEADBAND:
-            control = 0.0
+            # 2) single-ray EMA (still one ray; just smoothed)
+            if first:
+                y_filt = y
+                y_prev = y
+                first = False
+            else:
+                y_filt = (1.0 - EMA_ALPHA) * y_filt + EMA_ALPHA * y
 
-        # 5️⃣ Apply equal wheel speeds (forward only)
-        robot.set_wheel_speeds(control, control)
+            # 3) error (far → positive; close → negative)
+            e = y_filt - TARGET
 
-        # 6️⃣ Print diagnostics
-        print(f"Dist={actual:5.2f} m  Err={error:+6.3f}  u={control:+6.3f}")
+            # 4) deadband → full brake + reset integral (prevents creep)
+            if abs(e) <= DEADBAND:
+                bot.stop_motors()
+                integ = 0.0
+                print(f"[STOP] y={y_filt:.3f} m | e={e:+.3f}")
+                # small settle to avoid twitch in next loop
+                time.sleep(DT)
+                continue
 
-        # optional: delay slightly for clarity
-        time.sleep(dt)
+            # 5) derivative on measurement (d(y)/dt) → subtract to damp approach
+            dy = (y_filt - y_prev) / DT if y_prev is not None else 0.0
+            y_prev = y_filt
+
+            # 6) raw PID (in RPM)
+            #    u = Kp*e + Ki*∫e dt − Kd*dy/dt   (minus sign on derivative of measurement)
+            p_term = Kp_rpm * e
+            i_term = Ki_rpm * integ
+            d_term = -Kd_rpm * dy
+            u_raw  = p_term + i_term + d_term
+
+            # 7) saturation + anti-windup: integrate only when not saturated
+            u_sat  = clamp(u_raw, -RPM_SOFT, RPM_SOFT)
+            if abs(u_raw - u_sat) < 1e-6:
+                # not saturated → allow integral to grow
+                integ += e * DT
+                # clamp the integral’s effect so it can’t dominate
+                integ = clamp(integ, -I_CLAMP / max(Ki_rpm, 1e-9), I_CLAMP / max(Ki_rpm, 1e-9))
+            else:
+                # slightly bleed integral when saturated
+                integ *= 0.98
+
+            # 8) final hard clamp to motor range
+            rpm_cmd = clamp(u_sat, -RPM_MAX, RPM_MAX)
+
+            # 9) same sign to both motors → straight (matches your hardware behavior)
+            bot.set_left_motor_speed(rpm_cmd)
+            bot.set_right_motor_speed(rpm_cmd)
+
+            print(f"[RUN ] y={y_filt:.3f} m | e={e:+.3f} | P={p_term:+6.1f} I={i_term:+6.1f} D={d_term:+6.1f} | rpm={rpm_cmd:+6.1f}")
+
+            # loop timing
+            elapsed = time.time() - t0
+            if elapsed < DT:
+                time.sleep(DT - elapsed)
+
+    except KeyboardInterrupt:
+        print("\n[Task1/PID] Stopping…")
+    finally:
+        bot.stop_motors()
 
 if __name__ == "__main__":
     main()
