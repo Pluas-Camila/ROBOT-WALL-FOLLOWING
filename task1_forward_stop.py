@@ -116,7 +116,7 @@ def main():
             # 8) final hard clamp to motor range
             rpm_cmd = clamp(u_sat, -RPM_MAX, RPM_MAX)
 
-            # 9) same sign to both motors → straight (matches your hardware behavior)
+            # 9) same sign to both motors → straight
             bot.set_left_motor_speed(rpm_cmd)
             bot.set_right_motor_speed(rpm_cmd)
 
