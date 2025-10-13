@@ -1,0 +1,189 @@
+# task2_wall_follow_hambot_fixedidx.py
+# HamBot wall follow (fixed FAIRIS indexing):
+#  0=back, 90=left, 180=front, 270=right
+#  left-wall: side=90, diag=135; front=180
+#  right-wall: side=270, diag=225; front=180
+
+import time, math, statistics
+from robot_systems.robot import HamBot
+
+# ---- user knobs ----
+FOLLOW_SIDE   = "left"     # "left" or "right"
+DESIRED_SIDE  = 0.30       # meters
+
+# front handling
+SLOW_START    = 0.70       # m
+TURN_TRIGGER  = 0.40       # m  -> fixed 90°
+EMERGENCY_STOP= 0.22       # m  -> immediate stop
+
+# steering PD (outputs RPM differential)
+K_SIDE  = 140.0            # rpm / m
+K_ALPHA = 70.0             # rpm / rad
+KD      = 50.0             # rpm / (m/s)
+
+# forward RPM
+BASE_RPM = 22.0
+MIN_RPM  = 4.0
+MAX_RPM  = 60.0            # HamBot clamps internally to ±75
+
+# wrap logic
+WRAP_ARC_RPM   = 14.0
+WRAP_STEER_RPM = 12.0
+WRAP_COUNT_N   = 6
+NO_WALL_THRESH = max(0.6, DESIRED_SIDE * 2.2)
+
+DT        = 0.02
+SPIN_RPM  = 28.0
+SPIN_TIME = 0.62           # ~90° on your floor; tweak ±0.03s
+WIN       = 2              # min over ±WIN beams for noise
+LIDAR_MAX_M = 4.0          # clip anything beyond this to "no return"
+
+# ---- helpers ----
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+
+def unit_scale_to_m(scan):
+    """Infer units → meters: mm/cm/m."""
+    vals = [float(x) for x in scan if x and x > 0 and math.isfinite(x)]
+    if not vals:
+        return 1.0
+    m = statistics.median(vals)
+    if m > 1000.0: return 1.0/1000.0  # mm → m
+    if m > 10.0:   return 1.0/100.0   # cm → m
+    return 1.0                       # already meters
+
+def beam_min(scan_m, idx, win=0):
+    n = len(scan_m); vals=[]
+    for k in range(-win, win+1):
+        v = float(scan_m[(idx+k) % n])
+        if v > 0.0 and math.isfinite(v):
+            vals.append(v)
+    # treat super-far as no hit
+    mn = min(vals) if vals else float("inf")
+    return mn if mn <= LIDAR_MAX_M else float("inf")
+
+def side_geometry_45(side_d, diag_d):
+    """Estimate perpendicular distance and wall angle using 45° geometry."""
+    if side_d <= 0 or diag_d <= 0 or not (math.isfinite(side_d) and math.isfinite(diag_d)):
+        return float("inf"), 0.0
+    th = math.radians(45.0)
+    denom = diag_d * math.sin(th)
+    if denom <= 1e-6:
+        return float("inf"), 0.0
+    tan_alpha = (diag_d * math.cos(th) - side_d) / denom
+    alpha = math.atan(tan_alpha)    # +CCW
+    Dperp = side_d * math.cos(alpha)
+    return Dperp, alpha
+
+def forward_cmd(bot, rpm_fwd, rpm_diff):
+    rpm_fwd = clamp(rpm_fwd, 0.0, MAX_RPM)
+    if FOLLOW_SIDE == "left":
+        L = rpm_fwd - rpm_diff; R = rpm_fwd + rpm_diff
+    else:
+        L = rpm_fwd + rpm_diff; R = rpm_fwd - rpm_diff
+    bot.set_left_motor_speed(-L)    # HamBot left is inverted
+    bot.set_right_motor_speed(+R)
+
+def spin_90(bot, direction):
+    if direction == "left":
+        bot.set_left_motor_speed(+SPIN_RPM)
+        bot.set_right_motor_speed(+SPIN_RPM)
+    else:
+        bot.set_left_motor_speed(-SPIN_RPM)
+        bot.set_right_motor_speed(-SPIN_RPM)
+    time.sleep(SPIN_TIME)
+    bot.stop_motors()
+
+def main():
+    bot = HamBot(lidar_enabled=True, camera_enabled=False)
+    print(f"[Task2] Following {FOLLOW_SIDE} wall at {DESIRED_SIDE:.2f} m")
+
+    # fixed FAIRIS indices
+    IDX_FRONT = 180
+    if FOLLOW_SIDE == "left":
+        IDX_SIDE = 90
+        IDX_DIAG = 135
+    else:
+        IDX_SIDE = 270
+        IDX_DIAG = 225
+
+    prev_err = 0.0
+    no_wall_count = 0
+
+    try:
+        while True:
+            t0 = time.time()
+            raw = bot.get_range_image()
+            if raw == -1 or not raw:
+                bot.stop_motors(); time.sleep(DT); continue
+
+            # to meters + clip
+            s = unit_scale_to_m(raw)
+            scan_m = [float(x)*s if (x and x>0) else float("inf") for x in raw]
+
+            front = beam_min(scan_m, IDX_FRONT, WIN)
+            side  = beam_min(scan_m, IDX_SIDE,  WIN)
+            diag  = beam_min(scan_m, IDX_DIAG,  WIN)
+
+            # 1) front safety
+            if front < EMERGENCY_STOP:
+                bot.stop_motors()
+                print(f"[EMERG] front={front:.2f} m → stop+turn")
+                spin_90(bot, "right" if FOLLOW_SIDE=="left" else "left")
+                prev_err = 0.0; no_wall_count = 0
+                continue
+
+            if front < TURN_TRIGGER:
+                bot.stop_motors()
+                print(f"[TURN ] front={front:.2f} m → 90°")
+                spin_90(bot, "right" if FOLLOW_SIDE=="left" else "left")
+                prev_err = 0.0; no_wall_count = 0
+                continue
+
+            # 2) forward ramp based on front
+            if front >= SLOW_START:
+                fwd = BASE_RPM
+            else:
+                if front <= TURN_TRIGGER:
+                    fwd = MIN_RPM
+                else:
+                    t = (front - TURN_TRIGGER)/(SLOW_START - TURN_TRIGGER)
+                    fwd = MIN_RPM + t*(BASE_RPM - MIN_RPM)
+
+            # 3) no-wall detection
+            if (side > NO_WALL_THRESH) and (diag > NO_WALL_THRESH):
+                no_wall_count += 1
+            else:
+                no_wall_count = 0
+
+            if no_wall_count >= WRAP_COUNT_N:
+                print(f"[WRAP] no wall → arc {FOLLOW_SIDE} (side={side:.2f}, diag={diag:.2f})")
+                forward_cmd(bot, WRAP_ARC_RPM, WRAP_STEER_RPM)
+                time.sleep(DT)
+                continue
+
+            # 4) side geometry & PD
+            side_perp, alpha = side_geometry_45(side, diag)
+            err  = DESIRED_SIDE - side_perp       # + if too far
+            derr = (err - prev_err)/DT
+            prev_err = err
+
+            steer = K_SIDE*err + K_ALPHA*alpha + KD*derr
+            forward_cmd(bot, fwd, steer)
+
+            # debug
+            if int(time.time()*10) % 2 == 0:
+                print(f"[dbg] F={front:.2f}  S={side:.2f}  Dg={diag:.2f}  ⟂={side_perp:.2f}  "
+                      f"α={math.degrees(alpha):+4.1f}°  err={err:+.3f}  fwd={fwd:4.1f}  steer={steer:+.1f}")
+
+            # pace
+            elapsed = time.time()-t0
+            if elapsed < DT:
+                time.sleep(DT-elapsed)
+
+    except KeyboardInterrupt:
+        print("\n[Task2] stop.")
+    finally:
+        bot.stop_motors()
+
+if __name__ == "__main__":
+    main()
