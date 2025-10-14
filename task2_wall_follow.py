@@ -1,20 +1,19 @@
 # wall_follow_hambot_curve_turn.py
 # -------------------------------------------------------------
-# HamBot – Task 2 wall following (cautious, curved turns) with selectable side
+# HamBot – Task 2 wall following (cautious, curved turns)
 # - Uses HamBot.get_range_image() (360 beams: 0=back, 90=left, 180=front, 270=right)
 # - Normalizes each scan to meters (auto-detect mm/cm/m)
 # - PD on side distance for steering; P(+D) on forward speed
 # - Curved, sensor-driven cornering (bounded ≤45° arcs, edge hugging)
 # - Gentle wrap-search if wall vanishes
 # - Extra diagonals (±45°) and inner-wheel boost when wall is “lost”
-# - FOLLOW_SIDE selectable via CLI: python file.py [left|right]
 # -------------------------------------------------------------
 
-import sys, time, math
+import time, math
 from robot_systems.robot import HamBot
 
 # === Behavior toggles & targets ===
-FOLLOW_SIDE   = "left"   # will be overridden by CLI args below if provided
+FOLLOW_SIDE   = "left"   # "left" or "right"
 DT            = 0.02     # control period (s)
 TARGET_SIDE   = 0.30     # desired distance to side wall (m)
 STOP_HARD     = 0.25     # emergency stop (front) (m)
@@ -54,8 +53,8 @@ LDIAG_IDX = 135             # front-left diagonal (≈+45° from 90)
 RDIAG_IDX = 225             # front-right diagonal (≈-45° from 270)
 
 # Extra 45° diagonals (requested)
-L45_IDX   = 120             # between left (90) and front-left diag (135)
-R45_IDX   = 240             # between right (270) and front-right diag (225)
+L45_IDX   = 120             # ~ halfway between left (90) and front-left diag (135)
+R45_IDX   = 240             # ~ halfway between right (270) and front-right diag (225)
 
 # -------------------------------------------------------------
 # HamBot Physical Specifications (from datasheet)
@@ -136,28 +135,9 @@ def normalize_scan_to_m(scan):
     return out
 
 # -------------------------------------------------------------
-# CLI parsing for FOLLOW_SIDE
-# -------------------------------------------------------------
-def parse_follow_side_from_argv():
-    global FOLLOW_SIDE
-    # Accept: python file.py right   OR   python file.py --side right
-    args = [a.lower() for a in sys.argv[1:]]
-    if not args:
-        return
-    if args[0] in ("left", "right"):
-        FOLLOW_SIDE = args[0]
-        return
-    if "--side" in args:
-        i = args.index("--side")
-        if i + 1 < len(args) and args[i+1] in ("left", "right"):
-            FOLLOW_SIDE = args[i+1]
-
-# -------------------------------------------------------------
 # Main
 # -------------------------------------------------------------
 def main():
-    parse_follow_side_from_argv()
-
     bot = HamBot(lidar_enabled=True, camera_enabled=False)
     time.sleep(0.3)
 
@@ -206,17 +186,18 @@ def main():
 
             # --- Curved cornering (bounded ≤45° & edge-hugging) ---
             if front_d < TURN_TRIGGER:
-                # Turn decision, mirrored for side
+                # Turn decision (LEFT-follow mirrored for RIGHT-follow)
                 if FOLLOW_SIDE == "left":
                     if front_d < SIDE_BLOCK and left_d < SIDE_BLOCK:
                         turn_dir = "RIGHT"  # classic right-corner
                     elif (left_d > TARGET_SIDE*1.8) or (ldiag > TARGET_SIDE*1.8) or (l45 > TARGET_SIDE*1.8):
                         turn_dir = "LEFT"   # new left edge appears; hug it
                     else:
+                        # tie-break by openness (check both 45° and 45°+)
                         left_open  = max(ldiag, l45)
                         right_open = max(rdiag, r45)
                         turn_dir = "LEFT" if left_open >= right_open else "RIGHT"
-                else:  # FOLLOW_SIDE == "right"
+                else:
                     if front_d < SIDE_BLOCK and right_d < SIDE_BLOCK:
                         turn_dir = "LEFT"
                     elif (right_d > TARGET_SIDE*1.8) or (rdiag > TARGET_SIDE*1.8) or (r45 > TARGET_SIDE*1.8):
@@ -250,41 +231,39 @@ def main():
                     r45_now   = beam(sc_m, R45_IDX,   win=1)
 
                     # Adaptive arc speeds (smooth + edge-hug + wall-loss inner boost)
-                    if (turn_dir == "LEFT" and FOLLOW_SIDE == "left") or (turn_dir == "RIGHT" and FOLLOW_SIDE == "right"):
-                        # turning toward the followed side → inner = left when left-follow, inner = right when right-follow
-                        if turn_dir == "LEFT":
-                            target_L = ARC_SLOW_RPM
-                            target_R = ARC_FAST_RPM
-                            # losing left wall? boost inner (left), ease outer
+                    if turn_dir == "LEFT":
+                        target_L = ARC_SLOW_RPM
+                        target_R = ARC_FAST_RPM
+
+                        # If the left edge “opens” (risk losing wall), slow/ tighten slightly
+                        if FOLLOW_SIDE == "left":
                             if (not math.isfinite(Sd)) or (Sd > WALL_GONE) or (ldiag_now > WALL_GONE) or (l45_now > WALL_GONE):
+                                # gentle inner-wheel boost to curve inward and re-touch the edge
                                 target_L = min(MAX_RPM, target_L * 1.25)
                                 target_R = max(0.0,    target_R * 0.95)
-                        else:  # RIGHT with right-follow
-                            target_L = ARC_FAST_RPM
-                            target_R = ARC_SLOW_RPM
+
+                        # Smoothness: blend curvature by front clearance
+                        softness   = clamp((f - STOP_HARD) / max(FRONT_CLEAR - STOP_HARD, 1e-6), 0.0, 1.0)
+                        target_L   = target_L * (0.80 + 0.20 * softness)
+                        target_R   = target_R * (0.95 + 0.05 * softness)
+
+                    else:  # RIGHT turn
+                        target_L = ARC_FAST_RPM
+                        target_R = ARC_SLOW_RPM
+
+                        # If right-follow was selected, mirror; for left-follow this is “right corner”
+                        if FOLLOW_SIDE == "right":
                             if (not math.isfinite(Sd)) or (Sd > WALL_GONE) or (rdiag_now > WALL_GONE) or (r45_now > WALL_GONE):
                                 target_R = min(MAX_RPM, target_R * 1.25)
                                 target_L = max(0.0,    target_L * 0.95)
-                    else:
-                        # turning away from followed side (classic opposite corner)
-                        if turn_dir == "LEFT":
-                            target_L = ARC_SLOW_RPM
-                            target_R = ARC_FAST_RPM
-                        else:
-                            target_L = ARC_FAST_RPM
-                            target_R = ARC_SLOW_RPM
 
-                    # Smoothness based on front clearance (both directions)
-                    softness = clamp((f - STOP_HARD) / max(FRONT_CLEAR - STOP_HARD, 1e-6), 0.0, 1.0)
-                    if turn_dir == "LEFT":
-                        target_L = target_L * (0.80 + 0.20 * softness)
-                        target_R = target_R * (0.95 + 0.05 * softness)
-                    else:
-                        target_L = target_L * (0.90 + 0.10 * softness)
-                        target_R = target_R * (0.65 + 0.35 * softness)
+                        # Soften sharp right turns when tight in front
+                        softness   = clamp((f - STOP_HARD) / max(FRONT_CLEAR - STOP_HARD, 1e-6), 0.0, 1.0)
+                        target_L   = target_L * (0.90 + 0.10 * softness)
+                        target_R   = target_R * (0.65 + 0.35 * softness)
 
                     # Ramp toward targets
-                    cmd_L = ramp(cmd_L, target_L, step=3.0)
+                    cmd_L = ramp(cmd_L, target_L, step=3.0)   # rpm/iteration (small steps = smooth)
                     cmd_R = ramp(cmd_R, target_R, step=3.0)
                     bot.set_left_motor_speed(cmd_L)
                     bot.set_right_motor_speed(cmd_R)
@@ -352,7 +331,7 @@ def main():
             r = beam(scan_m, 270)
             print(f"[FOLLOW] side={side_d:.2f}  front={front_d:.2f}  vf={v_fwd:.1f}  "
                   f"steer={steer:+.1f}  L={left_rpm:.1f} R={right_rpm:.1f}")
-            print(f"[SENSE]  F/L/R/B(m): {f:.2f} {l:.2f} {r:.2f} {beam(scan_m,0)::.2f}  "
+            print(f"[SENSE]  F/L/R/B(m): {f:.2f} {l:.2f} {r:.2f} {beam(scan_m,0):.2f}  "
                   f"Ld={ldiag:.2f} Rd={rdiag:.2f} L45={l45:.2f} R45={r45:.2f}")
 
             time.sleep(DT)
